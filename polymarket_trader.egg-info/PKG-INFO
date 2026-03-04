@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: polymarket-trader
+Version: 0.1.0
+Summary: Paper trading library for Polymarket prediction markets
+Requires-Python: >=3.11
+Requires-Dist: websockets>=12
+Requires-Dist: certifi
+Provides-Extra: dev
+Requires-Dist: pytest>=8; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.23; extra == "dev"
