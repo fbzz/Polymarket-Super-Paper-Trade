@@ -126,10 +126,10 @@ class PolymarketFeed:
             return None
 
         order_book = OrderBook(
-            yes_bids=_parse_levels(yes_bids),
-            yes_asks=_parse_levels(yes_asks),
-            no_bids=_parse_levels(no_bids),
-            no_asks=_parse_levels(no_asks),
+            yes_bids=sorted(_parse_levels(yes_bids), key=lambda l: l.price, reverse=True),
+            yes_asks=sorted(_parse_levels(yes_asks), key=lambda l: l.price),
+            no_bids=sorted(_parse_levels(no_bids), key=lambda l: l.price, reverse=True),
+            no_asks=sorted(_parse_levels(no_asks), key=lambda l: l.price),
         )
         return PriceTick(
             market_id=market_id,

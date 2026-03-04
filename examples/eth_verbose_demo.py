@@ -11,6 +11,8 @@ import logging
 import time
 
 from polymarket_trader import (
+    InsufficientFundsError,
+    MinimumOrderError,
     PaperTrader,
     TickStats,
     fmt_cash,
@@ -101,8 +103,12 @@ async def on_tick(event):
             open_trade = None
 
         # open new
-        direction  = _pick_direction()
-        open_trade = trader.buy(direction, shares=10)
+        direction = _pick_direction()
+        try:
+            open_trade = trader.buy(direction, shares=10)
+        except (MinimumOrderError, InsufficientFundsError):
+            _last_trade = now
+            return
         _trade_num += 1
         _last_trade = now
         print()

@@ -37,6 +37,7 @@ asyncio.run(trader.stream(on_tick))
   - [Accessing trade history and portfolio state](#accessing-trade-history-and-portfolio-state)
   - [Placing orders from your algorithm](#placing-orders-from-your-algorithm)
   - [Fees](#fees)
+  - [Order Types](#order-types)
   - [Using the raw feed without PaperTrader](#using-the-raw-feed-without-papertrader)
   - [Running multiple markets in parallel](#running-multiple-markets-in-parallel)
   - [Building a strategy class](#building-a-strategy-class)
@@ -157,7 +158,7 @@ trader = PaperTrader(market_id="btc-updown-5m-1700000300")
 trader = PaperTrader(asset="btc", interval="5m")
 trade  = trader.buy("YES", shares=10, price=0.62)
 closed = trader.close(trade.id, price=0.71)
-print(f"PnL: {closed.pnl:+.4f}")   # PnL: +0.9000
+print(f"PnL: {closed.pnl:+.4f}")   # net of fees
 ```
 
 ---
@@ -196,14 +197,29 @@ yes_price = (best_yes_bid + best_yes_ask) / 2
 no_price  = (best_no_bid  + best_no_ask)  / 2
 ```
 
+`yes_price` and `no_price` are for display and signal computation only. They are **not** the prices used to fill orders.
+
 If one side is sparse, the missing price falls back to `1 - other_price`.
+
+**Order fill prices**
+
+When you call `buy()` or `close()` without an explicit `price=`, the library walks the real order book to compute a VWAP fill price:
+
+- `buy("YES", ...)` fills against **YES asks** (ascending — cheapest first)
+- `buy("NO", ...)` fills against **NO asks** (ascending)
+- `close()` on a YES position fills against **YES bids** (descending — highest first)
+- `close()` on a NO position fills against **NO bids** (descending)
+
+If the relevant side of the book is empty, the fill falls back to the midpoint. Passing an explicit `price=` bypasses the book entirely and uses that price directly.
 
 **PnL at close:**
 
 | Direction | Formula |
 |-----------|---------|
-| YES | `(exit − entry) × shares` |
-| NO  | `(entry − exit) × shares` |
+| YES | `(exit_fill − entry_fill) × shares` |
+| NO  | `(entry_fill − exit_fill) × shares` |
+
+`entry_fill` and `exit_fill` are the VWAP prices derived from the book (or the explicit `price=` if supplied), not the midpoint.
 
 ### Market Rotation
 
@@ -522,6 +538,20 @@ print(trade.unrealised(0.65))   # +0.3000
 
 Call `trader.buy()` and `trader.close()` directly from inside your `on_tick` callback — or from any async task running alongside the feed. Both methods are synchronous and return immediately.
 
+**Fill price behaviour**
+
+By default, `buy()` and `close()` derive the fill price from the live order book:
+
+- `buy()` walks the ask side (ascending), computing a VWAP across however many levels are needed to fill `shares`. If the ask book is empty, the midpoint (`yes_price` / `no_price`) is used as a fallback.
+- `close()` walks the bid side (descending) using the same logic.
+
+Pass an explicit `price=` to skip the book entirely and use a fixed fill price — useful for backtesting or when you want deterministic output:
+
+```python
+trade  = trader.buy("YES", shares=10, price=0.62)   # fixed fill
+closed = trader.close(trade.id, price=0.71)         # fixed fill
+```
+
 #### Pattern 1 — signal-based entry and exit
 
 ```python
@@ -715,6 +745,121 @@ print(f"Need YES to move >{breakeven_move:.4f} to profit")
 s = trader.summary()
 print(s["fee_model"])
 # {"fee_rate": 0.25, "exponent": 2, "maker_rebate": 0.2}
+```
+
+---
+
+### Order Types
+
+`buy()` and `close()` support five time-in-force modes via the `tif=` keyword argument.
+
+#### Quick reference
+
+| `tif` | `price=` | Fills | Returns |
+|-------|----------|-------|---------|
+| `MARKET` (default) | optional | Immediately at VWAP | `Trade` |
+| `FOK` | optional | Immediately — full fill or error | `Trade` |
+| `FAK` | optional | Immediately — partial fill OK | `Trade` (actual filled shares) |
+| `GTC` | **required** | Immediately if spread crosses; else rests | `Trade` or `PendingOrder` |
+| `GTD` | **required** | Like GTC; auto-cancels at `expiration` unix ts | `Trade` or `PendingOrder` |
+
+```python
+from polymarket_trader import PaperTrader, TimeInForce
+import time
+
+trader = PaperTrader(asset="btc", interval="5m")
+
+# --- Market order (default, current behavior) ---
+trade = trader.buy("YES", shares=10)
+
+# --- Fill-or-Kill: entire order fills immediately or raises ---
+from polymarket_trader import InsufficientLiquidityError
+try:
+    trade = trader.buy("YES", shares=10, price=0.62, tif=TimeInForce.FOK)
+except InsufficientLiquidityError:
+    pass  # not enough depth at 0.62
+
+# --- Fill-and-Kill: partial fill OK ---
+trade = trader.buy("YES", shares=10, price=0.62, tif=TimeInForce.FAK)
+# trade.shares may be < 10 if book was thin
+
+# --- GTC limit order: rest until filled ---
+result = trader.buy("YES", shares=10, price=0.58, tif=TimeInForce.GTC)
+if isinstance(result, Trade):
+    pass  # filled immediately (ask was <= 0.58)
+else:
+    pass  # PendingOrder — resting, cash reserved
+
+# --- GTD limit order: expire at unix timestamp ---
+result = trader.buy(
+    "YES", shares=10, price=0.58,
+    tif=TimeInForce.GTD,
+    expiration=time.time() + 3600,   # expire in 1 hour
+)
+
+# --- Post-only: reject if order would cross spread ---
+from polymarket_trader import PostOnlyCancelledError
+try:
+    result = trader.buy("YES", shares=10, price=0.65, tif=TimeInForce.GTC, post_only=True)
+except PostOnlyCancelledError:
+    pass  # ask was below limit — would have crossed
+```
+
+#### Pending orders and fills
+
+When a GTC/GTD order is stored (doesn't immediately cross), `stream()` automatically checks it on every tick and emits an `OrderFillEvent` when the spread crosses the limit:
+
+```python
+from polymarket_trader import OrderFillEvent, PendingOrder, PriceTick
+
+async def on_tick(event):
+    if isinstance(event, PriceTick):
+        # place a resting buy
+        result = trader.buy("YES", shares=10, price=0.58, tif=TimeInForce.GTC)
+
+    elif isinstance(event, OrderFillEvent):
+        # a pending order was filled on this tick
+        print(f"Order {event.order_id} filled: {event.trade}")
+
+asyncio.run(trader.stream(on_tick))
+```
+
+#### Cancelling a pending order
+
+```python
+order = trader.buy("YES", shares=10, price=0.55, tif=TimeInForce.GTC)
+# ... later ...
+cancelled = trader.cancel_order(order.id)
+# reserved cash is released back to portfolio.cash
+```
+
+#### Closing with a limit order
+
+```python
+trade = trader.buy("YES", shares=10, price=0.50)
+
+# GTC close: rest until bid reaches 0.65
+result = trader.close(trade.id, price=0.65, tif=TimeInForce.GTC)
+# returns Trade (filled immediately) or PendingOrder (resting)
+```
+
+#### Fee rules by TIF
+
+| TIF | Fee tier |
+|-----|----------|
+| MARKET / FOK / FAK | Taker fee |
+| GTC/GTD — immediate cross | Taker fee |
+| GTC/GTD — resting fill on tick | Maker fee (lower) |
+| `post_only=True` | Always maker fee |
+
+#### `summary()` additions
+
+`trader.summary()` now includes:
+
+```python
+s = trader.summary()
+s["pending_orders"]  # number of resting GTC/GTD orders
+s["reserved_cash"]   # cash locked by buy limit orders
 ```
 
 ---
@@ -965,8 +1110,8 @@ Provide either `market_id` **or** both `asset` + `interval`.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `buy(direction, shares, price=None)` | `Trade` | Open a position; charges taker fee |
-| `close(trade_id, price=None, *, maker=False)` | `Trade` | Close a position; `maker=True` applies rebate |
+| `buy(direction, shares, price=None)` | `Trade` | Open a position. Without `price=`, fills against the ask side of the order book (VWAP). Charges taker fee. |
+| `close(trade_id, price=None, *, maker=False)` | `Trade` | Close a position. Without `price=`, fills against the bid side of the order book (VWAP). `maker=True` applies rebate. |
 | `close_all(price=None, *, maker=False)` | `list[Trade]` | Close every open position |
 | `summary()` | `dict` | Full portfolio snapshot including `fee_model` |
 | `async stream(on_tick)` | `None` | Start the WebSocket feed (runs forever) |
@@ -1009,16 +1154,18 @@ class MarketRotationTick:
 ```python
 @dataclass
 class OrderBook:
-    yes_bids: list[Level]   # YES buyers,  sorted best price first
-    yes_asks: list[Level]   # YES sellers, sorted best price first
-    no_bids:  list[Level]   # NO buyers
-    no_asks:  list[Level]   # NO sellers
+    yes_bids: list[Level]   # YES buyers,  descending (highest bid first)
+    yes_asks: list[Level]   # YES sellers, ascending  (cheapest ask first)
+    no_bids:  list[Level]   # NO buyers,   descending (highest bid first)
+    no_asks:  list[Level]   # NO sellers,  ascending  (cheapest ask first)
 
 @dataclass
 class Level:
     price: float   # 0.0 – 1.0
     size:  float   # shares available at this price
 ```
+
+Bids are always sorted descending and asks ascending, so `bids[0]` is always the best (highest) bid and `asks[0]` is always the best (cheapest) ask.
 
 Accessing depth:
 

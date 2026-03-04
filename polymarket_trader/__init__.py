@@ -23,14 +23,17 @@ from .display import (
 from .fees import CRYPTO_FEES, NO_FEES, SPORTS_FEES, FeeModel, detect_fee_model
 from .exceptions import (
     InsufficientFundsError,
+    InsufficientLiquidityError,
     MarketResolutionError,
     MinimumOrderError,
     NoPriceAvailableError,
+    OrderNotFoundError,
     PolymarketTraderError,
+    PostOnlyCancelledError,
     TradeAlreadyClosedError,
     TradeNotFoundError,
 )
-from .models import Portfolio, Trade
+from .models import OrderFillEvent, PendingOrder, Portfolio, TimeInForce, Trade
 from .paper_trader import PaperTrader
 from .utils import MarketClock, MarketSpec
 
@@ -63,10 +66,16 @@ __all__ = [
     "PolymarketTraderError",
     "NoPriceAvailableError",
     "InsufficientFundsError",
+    "InsufficientLiquidityError",
+    "OrderNotFoundError",
+    "PostOnlyCancelledError",
     "TradeNotFoundError",
     "TradeAlreadyClosedError",
     "MarketResolutionError",
     "MinimumOrderError",
+    "TimeInForce",
+    "PendingOrder",
+    "OrderFillEvent",
     "FeeModel",
     "CRYPTO_FEES",
     "SPORTS_FEES",

@@ -9,6 +9,8 @@ import asyncio
 import logging
 
 from polymarket_trader import (
+    InsufficientFundsError,
+    MinimumOrderError,
     PaperTrader,
     TickStats,
     fmt_cash,
@@ -73,7 +75,10 @@ async def on_tick(event):
 
     # ── strategy: buy YES on tick 3, close on tick 15 ─────────────────────
     if tick_count == 3:
-        open_trade = trader.buy("YES", shares=10)
+        try:
+            open_trade = trader.buy("YES", shares=10)
+        except (MinimumOrderError, InsufficientFundsError):
+            return
         print()
         print_trade_opened(open_trade)
         print(_bankroll_line())

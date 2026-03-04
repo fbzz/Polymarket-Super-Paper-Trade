@@ -24,3 +24,15 @@ class MinimumOrderError(PolymarketTraderError):
 
 class MarketResolutionError(PolymarketTraderError):
     """Raised when market resolution or rotation fails."""
+
+
+class InsufficientLiquidityError(PolymarketTraderError):
+    """Raised when a FOK order cannot be fully filled at the limit price."""
+
+
+class OrderNotFoundError(PolymarketTraderError):
+    """Raised when an order_id does not exist in pending orders."""
+
+
+class PostOnlyCancelledError(PolymarketTraderError):
+    """Raised when a post-only order would cross the spread (taker fill)."""

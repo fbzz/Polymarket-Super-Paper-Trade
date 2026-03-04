@@ -2,9 +2,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Literal, Optional
 
 TradeDirection = Literal["YES", "NO"]
+
+
+class TimeInForce(str, Enum):
+    MARKET = "MARKET"  # default — VWAP fill at market
+    GTC    = "GTC"     # resting limit, no expiry
+    GTD    = "GTD"     # resting limit, auto-expires at unix timestamp
+    FOK    = "FOK"     # immediate, full fill or raise InsufficientLiquidityError
+    FAK    = "FAK"     # immediate, partial fill OK, cancel the rest
 
 
 @dataclass
@@ -37,7 +46,28 @@ class MarketRotationTick:
     timestamp: str
 
 
-FeedEvent = PriceTick | MarketRotationTick
+@dataclass(slots=True)
+class PendingOrder:
+    id: str
+    market_id: str
+    direction: TradeDirection
+    shares: float
+    limit_price: float
+    tif: TimeInForce
+    post_only: bool
+    created_at: str
+    expiration: Optional[float]      # unix ts — GTD only, else None
+    close_trade_id: Optional[str]    # set for close orders; None for buys
+
+
+@dataclass
+class OrderFillEvent:
+    order_id: str
+    trade: "Trade"    # Trade created (buy) or updated (close)
+    timestamp: str
+
+
+FeedEvent = PriceTick | MarketRotationTick | OrderFillEvent
 
 
 @dataclass(slots=True)
@@ -75,12 +105,18 @@ class Trade:
 class Portfolio:
     cash: float = 1000.0
     trades: list[Trade] = field(default_factory=list)
+    pending_orders: list[PendingOrder] = field(default_factory=list)
     created_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
     updated_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
+
+    @property
+    def reserved_cash(self) -> float:
+        """Cash reserved by open GTC/GTD buy orders."""
+        return sum(o.shares * o.limit_price for o in self.pending_orders if o.close_trade_id is None)
 
     @property
     def open_trades(self) -> list[Trade]:
@@ -166,10 +202,41 @@ def trade_from_dict(d: dict) -> Trade:
     )
 
 
+def order_to_dict(o: PendingOrder) -> dict:
+    return {
+        "id": o.id,
+        "market_id": o.market_id,
+        "direction": o.direction,
+        "shares": o.shares,
+        "limit_price": o.limit_price,
+        "tif": o.tif.value,
+        "post_only": o.post_only,
+        "created_at": o.created_at,
+        "expiration": o.expiration,
+        "close_trade_id": o.close_trade_id,
+    }
+
+
+def order_from_dict(d: dict) -> PendingOrder:
+    return PendingOrder(
+        id=d["id"],
+        market_id=d["market_id"],
+        direction=d["direction"],
+        shares=d["shares"],
+        limit_price=d["limit_price"],
+        tif=TimeInForce(d["tif"]),
+        post_only=d["post_only"],
+        created_at=d["created_at"],
+        expiration=d.get("expiration"),
+        close_trade_id=d.get("close_trade_id"),
+    )
+
+
 def portfolio_to_dict(p: Portfolio) -> dict:
     return {
         "cash": p.cash,
         "trades": [trade_to_dict(t) for t in p.trades],
+        "pending_orders": [order_to_dict(o) for o in p.pending_orders],
         "created_at": p.created_at,
         "updated_at": p.updated_at,
     }
@@ -179,6 +246,7 @@ def portfolio_from_dict(d: dict) -> Portfolio:
     return Portfolio(
         cash=d["cash"],
         trades=[trade_from_dict(t) for t in d.get("trades", [])],
+        pending_orders=[order_from_dict(o) for o in d.get("pending_orders", [])],
         created_at=d["created_at"],
         updated_at=d["updated_at"],
     )

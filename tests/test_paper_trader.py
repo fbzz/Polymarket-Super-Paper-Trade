@@ -13,18 +13,27 @@ from polymarket_trader import (
     NO_FEES,
     SPORTS_FEES,
     InsufficientFundsError,
+    InsufficientLiquidityError,
     MinimumOrderError,
     NoPriceAvailableError,
+    OrderNotFoundError,
     PaperTrader,
+    PostOnlyCancelledError,
     TradeAlreadyClosedError,
     TradeNotFoundError,
 )
 from polymarket_trader.fees import FeeModel, detect_fee_model
 from polymarket_trader.models import (
+    Level,
     OrderBook,
+    OrderFillEvent,
+    PendingOrder,
     Portfolio,
     PriceTick,
+    TimeInForce,
     Trade,
+    order_from_dict,
+    order_to_dict,
     portfolio_from_dict,
     portfolio_to_dict,
     trade_from_dict,
@@ -38,13 +47,26 @@ from polymarket_trader.utils import INTERVAL_SECONDS, MarketClock, MarketSpec
 # ---------------------------------------------------------------------------
 
 
-def make_tick(yes=0.6, no=0.4, market_id="btc-updown-5m-9999999999") -> PriceTick:
+def make_tick(
+    yes=0.6,
+    no=0.4,
+    market_id="btc-updown-5m-9999999999",
+    yes_asks: list[Level] | None = None,
+    yes_bids: list[Level] | None = None,
+    no_asks: list[Level] | None = None,
+    no_bids: list[Level] | None = None,
+) -> PriceTick:
     return PriceTick(
         market_id=market_id,
         yes_price=yes,
         no_price=no,
         timestamp="2026-01-01T00:00:00+00:00",
-        order_book=OrderBook([], [], [], []),
+        order_book=OrderBook(
+            yes_bids=yes_bids or [],
+            yes_asks=yes_asks or [],
+            no_bids=no_bids or [],
+            no_asks=no_asks or [],
+        ),
     )
 
 
@@ -445,3 +467,341 @@ class TestFeeModel:
         s = trader.summary()
         assert "fee_model" in s
         assert s["fee_model"]["fee_rate"] == CRYPTO_FEES.fee_rate
+
+
+# ---------------------------------------------------------------------------
+# Order Types
+# ---------------------------------------------------------------------------
+
+
+class TestOrderTypes:
+    """Tests for TIF order types: MARKET, FOK, FAK, GTC, GTD, post_only."""
+
+    # --- MARKET (backward compat) ---
+
+    def test_market_default_unchanged(self):
+        trader = fresh_trader(cash=1000.0)
+        trade = trader.buy("YES", shares=10, price=0.5)
+        assert isinstance(trade, Trade)
+        assert trade.is_open
+
+    def test_market_explicit_tif(self):
+        trader = fresh_trader(cash=1000.0)
+        trade = trader.buy("YES", shares=10, price=0.5, tif=TimeInForce.MARKET)
+        assert isinstance(trade, Trade)
+
+    def test_market_tif_str_coercion(self):
+        trader = fresh_trader(cash=1000.0)
+        trade = trader.buy("YES", shares=10, price=0.5, tif="MARKET")
+        assert isinstance(trade, Trade)
+
+    # --- FOK ---
+
+    def test_fok_fills_when_sufficient_depth(self):
+        trader = fresh_trader(cash=1000.0)
+        # Provide enough YES asks below limit
+        tick = make_tick(
+            yes=0.6,
+            yes_asks=[Level(price=0.55, size=20)],
+        )
+        trader._latest_price = tick
+        trade = trader.buy("YES", shares=10, price=0.60, tif=TimeInForce.FOK)
+        assert isinstance(trade, Trade)
+        assert trade.shares == 10
+
+    def test_fok_raises_when_insufficient_depth(self):
+        trader = fresh_trader(cash=1000.0)
+        tick = make_tick(
+            yes=0.6,
+            yes_asks=[Level(price=0.55, size=5)],  # only 5, need 10
+        )
+        trader._latest_price = tick
+        with pytest.raises(InsufficientLiquidityError):
+            trader.buy("YES", shares=10, price=0.60, tif=TimeInForce.FOK)
+
+    def test_fok_raises_when_limit_price_too_low(self):
+        trader = fresh_trader(cash=1000.0)
+        tick = make_tick(
+            yes=0.6,
+            yes_asks=[Level(price=0.70, size=20)],  # ask above limit
+        )
+        trader._latest_price = tick
+        with pytest.raises(InsufficientLiquidityError):
+            trader.buy("YES", shares=10, price=0.60, tif=TimeInForce.FOK)
+
+    def test_fok_no_price_uses_all_levels(self):
+        trader = fresh_trader(cash=1000.0)
+        tick = make_tick(
+            yes=0.6,
+            yes_asks=[Level(price=0.59, size=10)],
+        )
+        trader._latest_price = tick
+        trade = trader.buy("YES", shares=10, tif=TimeInForce.FOK)
+        assert isinstance(trade, Trade)
+
+    # --- FAK ---
+
+    def test_fak_partial_fill(self):
+        trader = fresh_trader(cash=1000.0)
+        tick = make_tick(
+            yes=0.6,
+            yes_asks=[Level(price=0.55, size=4)],  # only 4 available
+        )
+        trader._latest_price = tick
+        trade = trader.buy("YES", shares=10, price=0.60, tif=TimeInForce.FAK)
+        assert isinstance(trade, Trade)
+        assert trade.shares == 4  # actual fill
+
+    def test_fak_full_fill_when_enough_depth(self):
+        trader = fresh_trader(cash=1000.0)
+        tick = make_tick(
+            yes=0.6,
+            yes_asks=[Level(price=0.55, size=20)],
+        )
+        trader._latest_price = tick
+        trade = trader.buy("YES", shares=10, price=0.60, tif=TimeInForce.FAK)
+        assert trade.shares == 10
+
+    def test_fak_raises_when_no_liquidity(self):
+        trader = fresh_trader(cash=1000.0)
+        tick = make_tick(
+            yes=0.6,
+            yes_asks=[Level(price=0.70, size=20)],  # all above limit
+        )
+        trader._latest_price = tick
+        with pytest.raises(InsufficientLiquidityError):
+            trader.buy("YES", shares=10, price=0.60, tif=TimeInForce.FAK)
+
+    # --- GTC ---
+
+    def test_gtc_requires_price(self):
+        trader = fresh_trader(cash=1000.0)
+        with pytest.raises(ValueError):
+            trader.buy("YES", shares=10, tif=TimeInForce.GTC)
+
+    def test_gtc_immediate_fill_when_crosses(self):
+        trader = fresh_trader(cash=1000.0)
+        # best_ask (0.55) <= limit_price (0.60) → immediate taker fill
+        tick = make_tick(
+            yes=0.6,
+            yes_asks=[Level(price=0.55, size=20)],
+        )
+        trader._latest_price = tick
+        result = trader.buy("YES", shares=10, price=0.60, tif=TimeInForce.GTC)
+        assert isinstance(result, Trade)
+        assert result.is_open
+
+    def test_gtc_stored_when_no_cross(self):
+        trader = fresh_trader(cash=1000.0)
+        # best_ask (0.70) > limit_price (0.60) → resting order
+        tick = make_tick(
+            yes=0.7,
+            yes_asks=[Level(price=0.70, size=20)],
+        )
+        trader._latest_price = tick
+        result = trader.buy("YES", shares=10, price=0.60, tif=TimeInForce.GTC)
+        assert isinstance(result, PendingOrder)
+        assert result.tif == TimeInForce.GTC
+        assert len(trader.portfolio.pending_orders) == 1
+
+    def test_gtc_reserves_cash(self):
+        trader = fresh_trader(cash=1000.0)
+        tick = make_tick(
+            yes=0.7,
+            yes_asks=[Level(price=0.70, size=20)],
+        )
+        trader._latest_price = tick
+        trader.buy("YES", shares=10, price=0.60, tif=TimeInForce.GTC)
+        # cash should be reduced by reserved amount
+        assert pytest.approx(trader.portfolio.cash) == 1000.0 - 10 * 0.60
+
+    def test_gtc_no_price_raises(self):
+        trader = fresh_trader(cash=1000.0)
+        trader._latest_price = None
+        with pytest.raises(ValueError):
+            trader.buy("YES", shares=10, tif=TimeInForce.GTC)
+
+    # --- GTC post_only ---
+
+    def test_gtc_post_only_raises_when_crosses(self):
+        trader = fresh_trader(cash=1000.0)
+        tick = make_tick(
+            yes=0.6,
+            yes_asks=[Level(price=0.55, size=20)],
+        )
+        trader._latest_price = tick
+        with pytest.raises(PostOnlyCancelledError):
+            trader.buy("YES", shares=10, price=0.60, tif=TimeInForce.GTC, post_only=True)
+
+    def test_gtc_post_only_stores_when_no_cross(self):
+        trader = fresh_trader(cash=1000.0)
+        tick = make_tick(
+            yes=0.7,
+            yes_asks=[Level(price=0.70, size=20)],
+        )
+        trader._latest_price = tick
+        result = trader.buy("YES", shares=10, price=0.60, tif=TimeInForce.GTC, post_only=True)
+        assert isinstance(result, PendingOrder)
+        assert result.post_only is True
+
+    # --- GTD expiry ---
+
+    def test_gtd_expires_on_check(self):
+        trader = fresh_trader(cash=1000.0)
+        # Create a GTD order with expiry in the past
+        tick = make_tick(
+            yes=0.7,
+            yes_asks=[Level(price=0.70, size=20)],
+        )
+        trader._latest_price = tick
+        past_expiry = time.time() - 1.0  # already expired
+        result = trader.buy("YES", shares=10, price=0.60, tif=TimeInForce.GTD, expiration=past_expiry)
+        assert isinstance(result, PendingOrder)
+        assert trader.portfolio.cash == pytest.approx(1000.0 - 10 * 0.60)
+
+        # Now trigger _check_pending_orders — should expire and release cash
+        fill_events = trader._check_pending_orders(tick)
+        assert len(fill_events) == 0
+        assert len(trader.portfolio.pending_orders) == 0
+        assert trader.portfolio.cash == pytest.approx(1000.0 - 10 * 0.60 + 10 * 0.60)  # cash restored
+
+    def test_gtd_fills_before_expiry(self):
+        trader = fresh_trader(cash=1000.0)
+        future_expiry = time.time() + 3600
+        # First place as resting (ask > limit)
+        setup_tick = make_tick(yes=0.7, yes_asks=[Level(price=0.70, size=20)])
+        trader._latest_price = setup_tick
+        result = trader.buy("YES", shares=10, price=0.60, tif=TimeInForce.GTD, expiration=future_expiry)
+        assert isinstance(result, PendingOrder)
+
+        # Tick with ask crossing limit → should fill
+        fill_tick = make_tick(yes=0.55, yes_asks=[Level(price=0.55, size=20)])
+        fill_events = trader._check_pending_orders(fill_tick)
+        assert len(fill_events) == 1
+        assert isinstance(fill_events[0].trade, Trade)
+
+    # --- cancel_order ---
+
+    def test_cancel_order_releases_cash(self):
+        trader = fresh_trader(cash=1000.0)
+        tick = make_tick(yes=0.7, yes_asks=[Level(price=0.70, size=20)])
+        trader._latest_price = tick
+        order = trader.buy("YES", shares=10, price=0.60, tif=TimeInForce.GTC)
+        assert isinstance(order, PendingOrder)
+        reserved = 10 * 0.60  # $6.00
+        assert trader.portfolio.cash == pytest.approx(1000.0 - reserved)
+
+        cancelled = trader.cancel_order(order.id)
+        assert cancelled.id == order.id
+        assert len(trader.portfolio.pending_orders) == 0
+        assert trader.portfolio.cash == pytest.approx(1000.0)
+
+    def test_cancel_order_not_found(self):
+        trader = fresh_trader(cash=1000.0)
+        with pytest.raises(OrderNotFoundError):
+            trader.cancel_order("nonexistent-id")
+
+    # --- Close with GTC ---
+
+    def test_close_gtc_stored_when_no_cross(self):
+        trader = fresh_trader(cash=1000.0)
+        trade = trader.buy("YES", shares=10, price=0.50)
+
+        # best_bid (0.40) < limit_price (0.60) → resting close order
+        tick = make_tick(yes=0.5, yes_bids=[Level(price=0.40, size=20)])
+        trader._latest_price = tick
+        result = trader.close(trade.id, price=0.60, tif=TimeInForce.GTC)
+        assert isinstance(result, PendingOrder)
+        assert result.close_trade_id == trade.id
+
+    def test_close_gtc_immediate_fill_when_crosses(self):
+        trader = fresh_trader(cash=1000.0)
+        trade = trader.buy("YES", shares=10, price=0.50)
+
+        # best_bid (0.65) >= limit_price (0.60) → immediate fill
+        tick = make_tick(yes=0.65, yes_bids=[Level(price=0.65, size=20)])
+        trader._latest_price = tick
+        result = trader.close(trade.id, price=0.60, tif=TimeInForce.GTC)
+        assert isinstance(result, Trade)
+        assert not result.is_open
+
+    def test_close_gtc_fills_on_tick(self):
+        trader = fresh_trader(cash=1000.0)
+        trade = trader.buy("YES", shares=10, price=0.50)
+        cash_after_buy = trader.portfolio.cash
+
+        # Place resting close order
+        setup_tick = make_tick(yes=0.5, yes_bids=[Level(price=0.40, size=20)])
+        trader._latest_price = setup_tick
+        trader.close(trade.id, price=0.60, tif=TimeInForce.GTC)
+
+        # Tick with bid crossing limit → should fill
+        fill_tick = make_tick(yes=0.65, yes_bids=[Level(price=0.65, size=20)])
+        fill_events = trader._check_pending_orders(fill_tick)
+        assert len(fill_events) == 1
+        assert not fill_events[0].trade.is_open
+        assert len(trader.portfolio.pending_orders) == 0
+
+    # --- PendingOrder serialisation ---
+
+    def test_pending_order_roundtrip(self):
+        order = PendingOrder(
+            id=str(uuid.uuid4()),
+            market_id="btc-updown-5m-9999999999",
+            direction="YES",
+            shares=10,
+            limit_price=0.60,
+            tif=TimeInForce.GTD,
+            post_only=False,
+            created_at="2026-01-01T00:00:00+00:00",
+            expiration=1700000000.0,
+            close_trade_id=None,
+        )
+        restored = order_from_dict(order_to_dict(order))
+        assert restored.id == order.id
+        assert restored.tif == TimeInForce.GTD
+        assert restored.expiration == 1700000000.0
+
+    def test_portfolio_serialise_with_pending_orders(self):
+        p = Portfolio(cash=900.0)
+        p.pending_orders = [
+            PendingOrder(
+                id="ord-1",
+                market_id="btc-updown-5m-9999999999",
+                direction="YES",
+                shares=10,
+                limit_price=0.60,
+                tif=TimeInForce.GTC,
+                post_only=False,
+                created_at="2026-01-01T00:00:00+00:00",
+                expiration=None,
+                close_trade_id=None,
+            )
+        ]
+        p2 = portfolio_from_dict(portfolio_to_dict(p))
+        assert len(p2.pending_orders) == 1
+        assert p2.pending_orders[0].tif == TimeInForce.GTC
+
+    def test_old_json_no_pending_orders_loads_cleanly(self):
+        """Backward compat: state files without pending_orders key load fine."""
+        old_dict = {
+            "cash": 500.0,
+            "trades": [],
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            # no 'pending_orders' key
+        }
+        p = portfolio_from_dict(old_dict)
+        assert p.pending_orders == []
+        assert p.cash == 500.0
+
+    # --- summary includes pending_orders and reserved_cash ---
+
+    def test_summary_includes_pending_and_reserved(self):
+        trader = fresh_trader(cash=1000.0)
+        tick = make_tick(yes=0.7, yes_asks=[Level(price=0.70, size=20)])
+        trader._latest_price = tick
+        trader.buy("YES", shares=10, price=0.60, tif=TimeInForce.GTC)
+        s = trader.summary()
+        assert s["pending_orders"] == 1
+        assert s["reserved_cash"] == pytest.approx(10 * 0.60)
