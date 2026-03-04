@@ -52,16 +52,23 @@ class Trade:
     exit_time: Optional[str] = None
     pnl: Optional[float] = None
     force_closed: bool = False
+    entry_fee: float = 0.0   # taker fee paid on open
+    exit_fee: float = 0.0    # taker/maker fee paid on close
 
     @property
     def is_open(self) -> bool:
         return self.exit_price is None
 
+    @property
+    def total_fees(self) -> float:
+        return self.entry_fee + self.exit_fee
+
     def unrealised(self, current_price: float) -> float:
+        """Price PnL minus entry fee (exit fee not yet known)."""
         if self.direction == "YES":
-            return (current_price - self.entry_price) * self.shares
+            return (current_price - self.entry_price) * self.shares - self.entry_fee
         else:
-            return (self.entry_price - current_price) * self.shares
+            return (self.entry_price - current_price) * self.shares - self.entry_fee
 
 
 @dataclass
@@ -137,6 +144,8 @@ def trade_to_dict(t: Trade) -> dict:
         "exit_time": t.exit_time,
         "pnl": t.pnl,
         "force_closed": t.force_closed,
+        "entry_fee": t.entry_fee,
+        "exit_fee": t.exit_fee,
     }
 
 
@@ -152,6 +161,8 @@ def trade_from_dict(d: dict) -> Trade:
         exit_time=d.get("exit_time"),
         pnl=d.get("pnl"),
         force_closed=d.get("force_closed", False),
+        entry_fee=d.get("entry_fee", 0.0),
+        exit_fee=d.get("exit_fee", 0.0),
     )
 
 

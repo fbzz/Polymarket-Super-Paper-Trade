@@ -9,6 +9,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from polymarket_trader import (
+    CRYPTO_FEES,
+    NO_FEES,
+    SPORTS_FEES,
     InsufficientFundsError,
     MinimumOrderError,
     NoPriceAvailableError,
@@ -16,6 +19,7 @@ from polymarket_trader import (
     TradeAlreadyClosedError,
     TradeNotFoundError,
 )
+from polymarket_trader.fees import FeeModel, detect_fee_model
 from polymarket_trader.models import (
     OrderBook,
     Portfolio,
@@ -45,7 +49,11 @@ def make_tick(yes=0.6, no=0.4, market_id="btc-updown-5m-9999999999") -> PriceTic
 
 
 def fresh_trader(**kwargs) -> PaperTrader:
-    """PaperTrader backed by a fresh in-memory portfolio (no disk I/O)."""
+    """PaperTrader backed by a fresh in-memory portfolio (no disk I/O).
+
+    Defaults to NO_FEES so that PnL assertions stay simple. Pass
+    fee_model=CRYPTO_FEES (or another FeeModel) to test fee behaviour.
+    """
     future_ts = int(time.time()) + 3600
     market_id = f"btc-updown-5m-{future_ts}"
     with patch("polymarket_trader.paper_trader.StateManager") as MockSM:
@@ -195,13 +203,15 @@ class TestPaperTraderBuy:
         trader._latest_price = make_tick(yes=0.6)
         trade = trader.buy("YES", shares=10)
         assert trade.direction == "YES"
-        assert pytest.approx(trader.portfolio.cash) == 1000.0 - 10 * 0.6
+        fee = CRYPTO_FEES.taker_fee(10, 0.6)
+        assert pytest.approx(trader.portfolio.cash) == 1000.0 - 10 * 0.6 - fee
 
     def test_buy_no_deducts_cash(self):
         trader = fresh_trader(cash=1000.0)
         trader._latest_price = make_tick(no=0.4)
         trade = trader.buy("NO", shares=5)
-        assert pytest.approx(trader.portfolio.cash) == 1000.0 - 5 * 0.4
+        fee = CRYPTO_FEES.taker_fee(5, 0.4)
+        assert pytest.approx(trader.portfolio.cash) == 1000.0 - 5 * 0.4 - fee
 
     def test_buy_with_explicit_price(self):
         trader = fresh_trader(cash=1000.0)
@@ -238,20 +248,25 @@ class TestPaperTraderClose:
         trader = fresh_trader()
         trade = self._open_trade(trader, "YES", price=0.5)
         closed = trader.close(trade.id, price=0.7)
-        assert pytest.approx(closed.pnl) == (0.7 - 0.5) * 10
+        entry_fee = CRYPTO_FEES.taker_fee(10, 0.5)
+        exit_fee  = CRYPTO_FEES.taker_fee(10, 0.7)
+        assert pytest.approx(closed.pnl) == (0.7 - 0.5) * 10 - entry_fee - exit_fee
 
     def test_close_no_positive_pnl(self):
         trader = fresh_trader()
         trade = self._open_trade(trader, "NO", price=0.5)
         closed = trader.close(trade.id, price=0.3)
-        assert pytest.approx(closed.pnl) == (0.5 - 0.3) * 10
+        entry_fee = CRYPTO_FEES.taker_fee(10, 0.5)
+        exit_fee  = CRYPTO_FEES.taker_fee(10, 0.3)
+        assert pytest.approx(closed.pnl) == (0.5 - 0.3) * 10 - entry_fee - exit_fee
 
     def test_close_credits_cash(self):
         trader = fresh_trader(cash=1000.0)
         trade = self._open_trade(trader, "YES", price=0.5, shares=10)
         cash_after_buy = trader.portfolio.cash
         trader.close(trade.id, price=0.7)
-        assert pytest.approx(trader.portfolio.cash) == cash_after_buy + 10 * 0.7
+        exit_fee = CRYPTO_FEES.taker_fee(10, 0.7)
+        assert pytest.approx(trader.portfolio.cash) == cash_after_buy + 10 * 0.7 - exit_fee
 
     def test_close_not_found(self):
         trader = fresh_trader()
@@ -350,3 +365,83 @@ class TestForceClose:
         trader._force_close_all(tick)
         assert trader._last_rotation is not None
         assert "force_closed_trades" in trader._last_rotation
+
+
+# ---------------------------------------------------------------------------
+# Fees
+# ---------------------------------------------------------------------------
+
+
+class TestFeeModel:
+    def test_no_fees_zero(self):
+        assert NO_FEES.taker_fee(100, 0.5) == 0.0
+        assert NO_FEES.maker_fee(100, 0.5) == 0.0
+
+    def test_crypto_taker_fee_at_midpoint(self):
+        # fee = shares * price * 0.25 * (price * (1 - price))^2
+        # = 100 * 0.5 * 0.25 * (0.5 * 0.5)^2 = 100 * 0.5 * 0.25 * 0.0625 = 0.78125
+        fee = CRYPTO_FEES.taker_fee(100, 0.5)
+        assert pytest.approx(fee, rel=1e-5) == 0.78125
+
+    def test_crypto_fee_near_zero_at_extremes(self):
+        # price very close to 0 or 1 → (price*(1-price))^2 is tiny → rounds to 0
+        assert CRYPTO_FEES.taker_fee(1, 0.001) == 0.0
+        assert CRYPTO_FEES.taker_fee(1, 0.999) == 0.0
+
+    def test_crypto_maker_fee_less_than_taker(self):
+        taker = CRYPTO_FEES.taker_fee(100, 0.5)
+        maker = CRYPTO_FEES.maker_fee(100, 0.5)
+        assert maker < taker
+        assert pytest.approx(maker, rel=1e-5) == taker * (1 - CRYPTO_FEES.maker_rebate)
+
+    def test_sports_fee_less_than_crypto(self):
+        crypto = CRYPTO_FEES.taker_fee(100, 0.5)
+        sports = SPORTS_FEES.taker_fee(100, 0.5)
+        assert sports < crypto
+
+    def test_effective_rate_zero_at_extremes(self):
+        assert CRYPTO_FEES.effective_rate(0.0) == 0.0
+        assert CRYPTO_FEES.effective_rate(1.0) == 0.0
+
+    def test_detect_fee_model_crypto(self):
+        assert detect_fee_model("btc") is CRYPTO_FEES
+        assert detect_fee_model("ETH") is CRYPTO_FEES
+
+    def test_detect_fee_model_default_no_fees(self):
+        assert detect_fee_model("trumpwin") is NO_FEES
+
+    def test_buy_with_fees_deducts_fee_from_cash(self):
+        trader = fresh_trader(cash=1000.0, fee_model=CRYPTO_FEES)
+        trade = trader.buy("YES", shares=100, price=0.5)
+        expected_fee = CRYPTO_FEES.taker_fee(100, 0.5)
+        assert trade.entry_fee == expected_fee
+        assert pytest.approx(trader.portfolio.cash) == 1000.0 - 100 * 0.5 - expected_fee
+
+    def test_close_pnl_includes_fees(self):
+        trader = fresh_trader(cash=1000.0, fee_model=CRYPTO_FEES)
+        trade = trader.buy("YES", shares=100, price=0.5)
+        entry_fee = trade.entry_fee
+        closed = trader.close(trade.id, price=0.6)
+        exit_fee = CRYPTO_FEES.taker_fee(100, 0.6)
+        expected_pnl = (0.6 - 0.5) * 100 - entry_fee - exit_fee
+        assert pytest.approx(closed.pnl, rel=1e-5) == expected_pnl
+        assert closed.exit_fee == exit_fee
+
+    def test_close_maker_uses_rebate(self):
+        trader = fresh_trader(cash=1000.0, fee_model=CRYPTO_FEES)
+        trade = trader.buy("YES", shares=100, price=0.5)
+        closed = trader.close(trade.id, price=0.6, maker=True)
+        expected_exit_fee = CRYPTO_FEES.maker_fee(100, 0.6)
+        assert closed.exit_fee == expected_exit_fee
+
+    def test_total_fees_property(self):
+        trader = fresh_trader(cash=1000.0, fee_model=CRYPTO_FEES)
+        trade = trader.buy("YES", shares=100, price=0.5)
+        closed = trader.close(trade.id, price=0.6)
+        assert closed.total_fees == closed.entry_fee + closed.exit_fee
+
+    def test_summary_includes_fee_model(self):
+        trader = fresh_trader(fee_model=CRYPTO_FEES)
+        s = trader.summary()
+        assert "fee_model" in s
+        assert s["fee_model"]["fee_rate"] == CRYPTO_FEES.fee_rate

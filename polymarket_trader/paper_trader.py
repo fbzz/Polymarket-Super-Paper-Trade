@@ -13,6 +13,7 @@ from .exceptions import (
     TradeAlreadyClosedError,
     TradeNotFoundError,
 )
+from .fees import FeeModel, detect_fee_model
 from .models import FeedEvent, MarketRotationTick, Portfolio, PriceTick, Trade
 from .state import StateManager
 from .utils import MarketClock, MarketSpec
@@ -31,6 +32,7 @@ class PaperTrader:
         initial_cash: float = 1000.0,
         state_file: str = "paper_trader_state.json",
         auto_close_on_rotation: bool = True,
+        fee_model: FeeModel | None = None,
     ) -> None:
         if market_id:
             self._market_spec = MarketClock.parse(market_id)
@@ -38,6 +40,13 @@ class PaperTrader:
             self._market_spec = MarketClock.current(asset, interval)
         else:
             raise ValueError("Provide either market_id or both asset and interval.")
+
+        # Fee model: explicit > auto-detected from asset > no fees
+        if fee_model is not None:
+            self._fee_model = fee_model
+        else:
+            _asset = self._market_spec.asset
+            self._fee_model = detect_fee_model(_asset)
 
         self._state = StateManager(state_file)
         self._portfolio = self._state.load()
@@ -64,6 +73,10 @@ class PaperTrader:
     @property
     def portfolio(self) -> Portfolio:
         return self._portfolio
+
+    @property
+    def fee_model(self) -> FeeModel:
+        return self._fee_model
 
     # ------------------------------------------------------------------
     # Trading API
@@ -92,9 +105,14 @@ class PaperTrader:
                 f"Order total ${cost:.4f} is below the $1.00 minimum "
                 f"({shares} shares × {price:.4f})."
             )
-        if cost > self._portfolio.cash:
+
+        fee = self._fee_model.taker_fee(shares, price)
+        total = cost + fee
+
+        if total > self._portfolio.cash:
             raise InsufficientFundsError(
-                f"Need {cost:.4f} but only {self._portfolio.cash:.4f} available."
+                f"Need ${total:.4f} (${cost:.4f} + ${fee:.4f} fee) "
+                f"but only ${self._portfolio.cash:.4f} available."
             )
 
         trade = Trade(
@@ -104,19 +122,38 @@ class PaperTrader:
             shares=shares,
             entry_price=price,
             entry_time=datetime.now(timezone.utc).isoformat(),
+            entry_fee=fee,
         )
-        self._portfolio.cash -= cost
+        self._portfolio.cash -= total
         self._portfolio.trades.append(trade)
         self._portfolio.updated_at = datetime.now(timezone.utc).isoformat()
         self._state.save(self._portfolio)
-        logger.info("BUY %s %s @ %.4f (cost %.4f)", direction, shares, price, cost)
+        logger.info(
+            "BUY %s %s @ %.4f  cost %.4f  fee %.4f  total %.4f",
+            direction, shares, price, cost, fee, total,
+        )
         return trade
 
     def close(
         self,
         trade_id: str,
         price: float | None = None,
+        *,
+        maker: bool = False,
     ) -> Trade:
+        """
+        Close an open position.
+
+        Parameters
+        ----------
+        trade_id : str
+            ID of the trade to close.
+        price : float | None
+            Exit price. Uses latest_price if omitted.
+        maker : bool
+            If True, applies maker rebate instead of full taker fee on exit.
+            Use this when you're closing with a resting limit order.
+        """
         trade = next((t for t in self._portfolio.trades if t.id == trade_id), None)
         if trade is None:
             raise TradeNotFoundError(f"Trade {trade_id!r} not found.")
@@ -134,25 +171,36 @@ class PaperTrader:
                 else self._latest_price.no_price
             )
 
-        if trade.direction == "YES":
-            pnl = (price - trade.entry_price) * trade.shares
-        else:
-            pnl = (trade.entry_price - price) * trade.shares
+        exit_fee = (
+            self._fee_model.maker_fee(trade.shares, price)
+            if maker
+            else self._fee_model.taker_fee(trade.shares, price)
+        )
+        proceeds = trade.shares * price - exit_fee
 
-        proceeds = trade.shares * price
+        if trade.direction == "YES":
+            pnl = (price - trade.entry_price) * trade.shares - trade.entry_fee - exit_fee
+        else:
+            pnl = (trade.entry_price - price) * trade.shares - trade.entry_fee - exit_fee
+
         trade.exit_price = price
         trade.exit_time = datetime.now(timezone.utc).isoformat()
+        trade.exit_fee = exit_fee
         trade.pnl = pnl
         self._portfolio.cash += proceeds
         self._portfolio.updated_at = datetime.now(timezone.utc).isoformat()
         self._state.save(self._portfolio)
         logger.info(
-            "CLOSE %s %s @ %.4f (pnl %.4f)", trade.direction, trade.shares, price, pnl
+            "CLOSE %s %s @ %.4f  fee %.4f  pnl %.4f",
+            trade.direction, trade.shares, price, exit_fee, pnl,
         )
         return trade
 
-    def close_all(self, price: float | None = None) -> list[Trade]:
-        return [self.close(t.id, price=price) for t in list(self._portfolio.open_trades)]
+    def close_all(self, price: float | None = None, *, maker: bool = False) -> list[Trade]:
+        return [
+            self.close(t.id, price=price, maker=maker)
+            for t in list(self._portfolio.open_trades)
+        ]
 
     # ------------------------------------------------------------------
     # Streaming
@@ -187,23 +235,21 @@ class PaperTrader:
         if not open_trades:
             return
 
-        # Use latest price or fall back to entry price
         lp = self._latest_price
         closed_ids = []
         for trade in open_trades:
-            if lp:
-                price = lp.yes_price if trade.direction == "YES" else lp.no_price
-            else:
-                price = trade.entry_price
+            price = (lp.yes_price if trade.direction == "YES" else lp.no_price) if lp else trade.entry_price
+            exit_fee = self._fee_model.taker_fee(trade.shares, price)
+            proceeds = trade.shares * price - exit_fee
 
             if trade.direction == "YES":
-                pnl = (price - trade.entry_price) * trade.shares
+                pnl = (price - trade.entry_price) * trade.shares - trade.entry_fee - exit_fee
             else:
-                pnl = (trade.entry_price - price) * trade.shares
+                pnl = (trade.entry_price - price) * trade.shares - trade.entry_fee - exit_fee
 
-            proceeds = trade.shares * price
             trade.exit_price = price
             trade.exit_time = datetime.now(timezone.utc).isoformat()
+            trade.exit_fee = exit_fee
             trade.pnl = pnl
             trade.force_closed = True
             self._portfolio.cash += proceeds
@@ -234,4 +280,9 @@ class PaperTrader:
         s["latest_yes_price"] = lp.yes_price if lp else None
         s["latest_no_price"] = lp.no_price if lp else None
         s["last_rotation"] = self._last_rotation
+        s["fee_model"] = {
+            "fee_rate": self._fee_model.fee_rate,
+            "exponent": self._fee_model.exponent,
+            "maker_rebate": self._fee_model.maker_rebate,
+        }
         return s

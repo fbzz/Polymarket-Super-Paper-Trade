@@ -20,6 +20,7 @@ from .display import (
     print_trade_closed,
     print_trade_opened,
 )
+from .fees import CRYPTO_FEES, NO_FEES, SPORTS_FEES, FeeModel, detect_fee_model
 from .exceptions import (
     InsufficientFundsError,
     MarketResolutionError,
@@ -66,4 +67,9 @@ __all__ = [
     "TradeAlreadyClosedError",
     "MarketResolutionError",
     "MinimumOrderError",
+    "FeeModel",
+    "CRYPTO_FEES",
+    "SPORTS_FEES",
+    "NO_FEES",
+    "detect_fee_model",
 ]

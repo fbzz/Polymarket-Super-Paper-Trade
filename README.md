@@ -35,6 +35,8 @@ asyncio.run(trader.stream(on_tick))
   - [Computing signals from order book data](#computing-signals-from-order-book-data)
   - [Rolling statistics with TickStats](#rolling-statistics-with-tickstats)
   - [Accessing trade history and portfolio state](#accessing-trade-history-and-portfolio-state)
+  - [Placing orders from your algorithm](#placing-orders-from-your-algorithm)
+  - [Fees](#fees)
   - [Using the raw feed without PaperTrader](#using-the-raw-feed-without-papertrader)
   - [Running multiple markets in parallel](#running-multiple-markets-in-parallel)
   - [Building a strategy class](#building-a-strategy-class)
@@ -49,6 +51,7 @@ asyncio.run(trader.stream(on_tick))
   - [Portfolio](#portfolio)
   - [MarketSpec & MarketClock](#marketspec--marketclock)
   - [TickStats](#tickstats)
+  - [FeeModel & fee constants](#feemodel--fee-constants)
   - [Display utilities](#display-utilities)
   - [Exceptions](#exceptions)
 - [State File Schema](#state-file-schema)
@@ -515,6 +518,207 @@ print(trade.unrealised(0.65))   # +0.3000
 
 ---
 
+### Placing orders from your algorithm
+
+Call `trader.buy()` and `trader.close()` directly from inside your `on_tick` callback — or from any async task running alongside the feed. Both methods are synchronous and return immediately.
+
+#### Pattern 1 — signal-based entry and exit
+
+```python
+import asyncio
+from polymarket_trader import PaperTrader, TickStats
+from polymarket_trader.models import PriceTick, MarketRotationTick
+
+trader = PaperTrader(asset="btc", interval="5m")
+stats  = TickStats(window=20)
+open_trade = None
+
+async def on_tick(event):
+    global open_trade
+
+    if isinstance(event, MarketRotationTick):
+        open_trade = None   # auto_close_on_rotation already closed it
+        return
+
+    if not isinstance(event, PriceTick):
+        return
+
+    stats.update(event)
+    mom = stats.momentum
+    if mom is None:
+        return
+
+    # --- entry ---
+    if open_trade is None and mom > 0.02:
+        open_trade = trader.buy("YES", shares=20)
+        print(f"Opened YES  entry={open_trade.entry_price:.4f}")
+
+    # --- exit ---
+    elif open_trade is not None and mom < 0:
+        closed = trader.close(open_trade.id)
+        print(f"Closed pnl={closed.pnl:+.4f}")
+        open_trade = None
+
+asyncio.run(trader.stream(on_tick))
+```
+
+#### Pattern 2 — time-based entry, close all before rotation
+
+```python
+import asyncio, time
+from polymarket_trader import PaperTrader
+from polymarket_trader.models import PriceTick, MarketRotationTick
+
+trader = PaperTrader(asset="btc", interval="5m", auto_close_on_rotation=False)
+last_trade_ts = 0.0
+
+async def on_tick(event):
+    global last_trade_ts
+
+    if isinstance(event, MarketRotationTick):
+        # close everything just before the window rolls
+        for t in trader.close_all():
+            print(f"Rotation close  pnl={t.pnl:+.4f}")
+        return
+
+    if not isinstance(event, PriceTick):
+        return
+
+    now = time.time()
+    # place a new trade every 60 seconds
+    if now - last_trade_ts >= 60:
+        trader.buy("YES", shares=10)
+        last_trade_ts = now
+
+asyncio.run(trader.stream(on_tick))
+```
+
+#### Pattern 3 — position sizing based on cash
+
+```python
+async def on_tick(event):
+    if not isinstance(event, PriceTick):
+        return
+
+    if trader.portfolio.open_trades:
+        return   # already in a position
+
+    cash  = trader.portfolio.cash
+    price = event.yes_price
+
+    # risk 10 % of remaining cash per trade
+    notional = cash * 0.10
+    shares   = notional / price
+
+    if shares * price >= 1.0:   # respect $1 minimum
+        trader.buy("YES", shares=shares)
+```
+
+#### Handling errors
+
+```python
+from polymarket_trader import (
+    InsufficientFundsError,
+    MinimumOrderError,
+    NoPriceAvailableError,
+)
+
+async def on_tick(event):
+    if isinstance(event, PriceTick):
+        try:
+            trader.buy("YES", shares=50)
+        except InsufficientFundsError:
+            pass   # not enough cash — skip
+        except MinimumOrderError:
+            pass   # order too small (< $1.00)
+        except NoPriceAvailableError:
+            pass   # no feed price yet (shouldn't happen inside on_tick)
+```
+
+---
+
+### Fees
+
+Polymarket charges a variable taker fee that depends on the token price.  The fee is highest near 50 % probability and falls toward zero at market extremes.
+
+```
+fee = shares × price × fee_rate × (price × (1 − price))^exponent
+```
+
+The library ships three ready-made fee models:
+
+| Model | `fee_rate` | `exponent` | Max fee at p=0.5 | For |
+|-------|-----------|-----------|-----------------|-----|
+| `CRYPTO_FEES` | 0.25 | 2 | ~1.56 % | BTC, ETH, SOL, XRP, … |
+| `SPORTS_FEES` | 0.0175 | 1 | ~0.44 % | NCAAB, Premier League, … |
+| `NO_FEES` | 0.0 | 1 | 0 % | backtesting / unit tests |
+
+The correct model is **auto-detected from the asset name**. You only need to pass one explicitly when you want to override:
+
+```python
+from polymarket_trader import PaperTrader, CRYPTO_FEES, SPORTS_FEES, NO_FEES
+
+# auto-detect (btc → CRYPTO_FEES)
+trader = PaperTrader(asset="btc", interval="5m")
+
+# explicit override
+trader = PaperTrader(asset="btc", interval="5m", fee_model=NO_FEES)
+```
+
+#### How fees appear on trades
+
+Every `Trade` records the fees charged:
+
+```python
+trade = trader.buy("YES", shares=100)
+trade.entry_fee    # taker fee charged at open  (e.g. 0.048828)
+trade.total_fees   # entry_fee + exit_fee (0.0 while open)
+
+closed = trader.close(trade.id)
+closed.exit_fee    # taker fee charged at close
+closed.total_fees  # full round-trip fee
+closed.pnl         # already net of both fees: price_pnl − entry_fee − exit_fee
+```
+
+#### Maker rebate
+
+When closing with a resting limit order (maker), pass `maker=True` to get a partial rebate:
+
+```python
+closed = trader.close(trade.id, maker=True)   # lower exit fee
+```
+
+`CRYPTO_FEES` gives a 20 % rebate; `SPORTS_FEES` gives 25 %.
+
+#### Fee-aware position sizing
+
+To ensure a trade is profitable after fees, factor in the round-trip cost:
+
+```python
+from polymarket_trader import CRYPTO_FEES
+
+price  = event.yes_price
+shares = 100
+
+entry_fee = CRYPTO_FEES.taker_fee(shares, price)
+exit_fee  = CRYPTO_FEES.taker_fee(shares, price)   # approximate
+total_fee = entry_fee + exit_fee
+
+# minimum price move needed to break even
+breakeven_move = total_fee / shares
+print(f"Need YES to move >{breakeven_move:.4f} to profit")
+```
+
+#### Inspecting the active fee model
+
+```python
+s = trader.summary()
+print(s["fee_model"])
+# {"fee_rate": 0.25, "exponent": 2, "maker_rebate": 0.2}
+```
+
+---
+
 ### Using the raw feed without PaperTrader
 
 If you only need the price/orderbook stream and no trading layer:
@@ -743,6 +947,7 @@ PaperTrader(
     initial_cash: float = 1000.0,
     state_file: str = "paper_trader_state.json",
     auto_close_on_rotation: bool = True,
+    fee_model: FeeModel | None = None,  # auto-detected from asset if omitted
 )
 ```
 
@@ -760,10 +965,10 @@ Provide either `market_id` **or** both `asset` + `interval`.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `buy(direction, shares, price=None)` | `Trade` | Open a position |
-| `close(trade_id, price=None)` | `Trade` | Close a position by ID |
-| `close_all(price=None)` | `list[Trade]` | Close every open position |
-| `summary()` | `dict` | Full portfolio snapshot |
+| `buy(direction, shares, price=None)` | `Trade` | Open a position; charges taker fee |
+| `close(trade_id, price=None, *, maker=False)` | `Trade` | Close a position; `maker=True` applies rebate |
+| `close_all(price=None, *, maker=False)` | `list[Trade]` | Close every open position |
+| `summary()` | `dict` | Full portfolio snapshot including `fee_model` |
 | `async stream(on_tick)` | `None` | Start the WebSocket feed (runs forever) |
 
 ---
@@ -841,16 +1046,21 @@ class Trade:
 
     exit_price:   float | None            # None while open
     exit_time:    str | None
-    pnl:          float | None            # None while open
+    pnl:          float | None            # None while open; net of all fees
     force_closed: bool                    # True if closed by auto-rotation
+    entry_fee:    float                   # taker fee charged at open
+    exit_fee:     float                   # taker/maker fee charged at close
 ```
+
+`pnl` is always **net of fees**: `(exit − entry) × shares − entry_fee − exit_fee` for YES (reversed for NO).
 
 #### Computed
 
 | Attribute / Method | Description |
 |--------------------|-------------|
 | `trade.is_open` | `True` if `exit_price is None` |
-| `trade.unrealised(price)` | Open PnL at a given price: `(price − entry) × shares` for YES, `(entry − price) × shares` for NO |
+| `trade.total_fees` | `entry_fee + exit_fee` — round-trip fee cost |
+| `trade.unrealised(price)` | Open PnL at a given price minus `entry_fee` (exit fee not yet known) |
 
 ---
 
@@ -954,6 +1164,49 @@ Returns signed bid/ask size imbalance using top-3 YES levels:
 
 ---
 
+### `FeeModel` & fee constants
+
+```python
+from polymarket_trader import CRYPTO_FEES, SPORTS_FEES, NO_FEES, FeeModel, detect_fee_model
+```
+
+#### Predefined models
+
+| Constant | `fee_rate` | `exponent` | `maker_rebate` | Default for |
+|----------|-----------|-----------|---------------|-------------|
+| `CRYPTO_FEES` | 0.25 | 2 | 0.20 | BTC, ETH, SOL, XRP, BNB, DOGE, … |
+| `SPORTS_FEES` | 0.0175 | 1 | 0.25 | All other assets |
+| `NO_FEES` | 0.0 | 1 | 0.0 | Backtesting / unit tests |
+
+#### `FeeModel` methods
+
+```python
+model.taker_fee(shares, price) → float   # full taker fee
+model.maker_fee(shares, price) → float   # taker fee × (1 − maker_rebate)
+model.effective_rate(price)    → float   # fee as fraction of notional
+```
+
+Minimum fee is `0.0001 USDC` — anything smaller rounds to zero.
+
+#### `detect_fee_model(asset: str) → FeeModel`
+
+Returns `CRYPTO_FEES` for known crypto assets, `NO_FEES` for everything else.
+
+```python
+detect_fee_model("btc")      # → CRYPTO_FEES
+detect_fee_model("sol")      # → CRYPTO_FEES
+detect_fee_model("ncaab")    # → NO_FEES  (no sports model auto-detected yet)
+```
+
+#### Custom fee model
+
+```python
+my_model = FeeModel(fee_rate=0.02, exponent=1, maker_rebate=0.30)
+trader    = PaperTrader(asset="btc", interval="5m", fee_model=my_model)
+```
+
+---
+
 ### Display utilities
 
 Import from `polymarket_trader` directly:
@@ -1012,7 +1265,8 @@ All inherit from `PolymarketTraderError`.
 from polymarket_trader import (
     PolymarketTraderError,    # base — catch all library errors
     NoPriceAvailableError,    # buy/close with no feed price and no explicit price=
-    InsufficientFundsError,   # shares × price > portfolio.cash
+    InsufficientFundsError,   # shares × price + fee > portfolio.cash
+    MinimumOrderError,        # shares × price < $1.00 minimum
     TradeNotFoundError,       # trade_id not in portfolio
     TradeAlreadyClosedError,  # closing a trade that is already closed
     MarketResolutionError,    # rotation / resolution failure
@@ -1022,7 +1276,11 @@ from polymarket_trader import (
 Recommended pattern:
 
 ```python
-from polymarket_trader import InsufficientFundsError, NoPriceAvailableError
+from polymarket_trader import (
+    InsufficientFundsError,
+    MinimumOrderError,
+    NoPriceAvailableError,
+)
 
 async def on_tick(event):
     if isinstance(event, PriceTick):
@@ -1030,6 +1288,8 @@ async def on_tick(event):
             trader.buy("YES", shares=50)
         except InsufficientFundsError as e:
             print(f"Skipping — {e}")
+        except MinimumOrderError:
+            pass   # order notional < $1.00
         except NoPriceAvailableError:
             pass   # shouldn't happen inside on_tick, but safe to guard
 ```
@@ -1053,8 +1313,10 @@ async def on_tick(event):
       "entry_time": "2026-01-01T00:02:14+00:00",
       "exit_price": 0.6500,
       "exit_time": "2026-01-01T00:04:51+00:00",
-      "pnl": 0.7000,
-      "force_closed": false
+      "pnl": 0.6513,
+      "force_closed": false,
+      "entry_fee": 0.020356,
+      "exit_fee": 0.028125
     }
   ],
   "created_at": "2026-01-01T00:00:00+00:00",
@@ -1124,15 +1386,16 @@ Token IDs are resolved from the Gamma API at runtime.
 pytest tests/ -v
 ```
 
-All 33 tests run without network access. `StateManager` and WebSocket calls are fully mocked.
+All 48 tests run without network access. `StateManager` and WebSocket calls are fully mocked.
 
 ```
 tests/test_paper_trader.py::TestMarketSpec::test_market_id_roundtrip     PASSED
 tests/test_paper_trader.py::TestMarketSpec::test_interval_seconds        PASSED
 ...
-tests/test_paper_trader.py::TestForceClose::test_force_close_updates_last_rotation PASSED
+tests/test_paper_trader.py::TestFeeModel::test_close_pnl_includes_fees  PASSED
+tests/test_paper_trader.py::TestFeeModel::test_summary_includes_fee_model PASSED
 
-33 passed in 0.07s
+48 passed in 0.08s
 ```
 
 ### Live demos

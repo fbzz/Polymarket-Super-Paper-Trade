@@ -1,5 +1,5 @@
 {
-  "cash": 490.20000000000005,
+  "cash": 490.95000000000005,
   "trades": [
     {
       "id": "6c1b16a3-ee66-4671-91ce-c8146aa5d65d",
@@ -80,12 +80,24 @@
       "shares": 10,
       "entry_price": 0.645,
       "entry_time": "2026-03-04T01:16:55.799211+00:00",
-      "exit_price": null,
-      "exit_time": null,
-      "pnl": null,
+      "exit_price": 0.405,
+      "exit_time": "2026-03-04T01:17:55.926369+00:00",
+      "pnl": -2.4,
+      "force_closed": false
+    },
+    {
+      "id": "a7a4bae3-4c31-404d-9af8-f69b7b7705de",
+      "market_id": "btc-updown-5m-1772586900",
+      "direction": "YES",
+      "shares": 10,
+      "entry_price": 0.405,
+      "entry_time": "2026-03-04T01:17:55.927507+00:00",
+      "exit_price": 0.07500000000000001,
+      "exit_time": "2026-03-04T01:18:55.931710+00:00",
+      "pnl": -3.3000000000000003,
       "force_closed": false
     }
   ],
   "created_at": "2026-03-04T00:41:19.384610+00:00",
-  "updated_at": "2026-03-04T01:16:55.799224+00:00"
+  "updated_at": "2026-03-04T01:18:55.931713+00:00"
 }
