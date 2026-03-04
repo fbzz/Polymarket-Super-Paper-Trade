@@ -6,6 +6,10 @@ Connect to any market via WebSocket, trade YES/NO positions with simulated cash,
 ![alt text](image.png)
 
 ```python
+import asyncio
+from polymarket_trader import PaperTrader
+from polymarket_trader.models import PriceTick
+
 trader = PaperTrader(asset="btc", interval="5m", initial_cash=500.0)
 
 async def on_tick(event):
