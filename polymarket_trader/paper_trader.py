@@ -8,6 +8,7 @@ from typing import Callable, Optional
 
 from .exceptions import (
     InsufficientFundsError,
+    MinimumOrderError,
     NoPriceAvailableError,
     TradeAlreadyClosedError,
     TradeNotFoundError,
@@ -86,6 +87,11 @@ class PaperTrader:
             )
 
         cost = shares * price
+        if cost < 1.0:
+            raise MinimumOrderError(
+                f"Order total ${cost:.4f} is below the $1.00 minimum "
+                f"({shares} shares × {price:.4f})."
+            )
         if cost > self._portfolio.cash:
             raise InsufficientFundsError(
                 f"Need {cost:.4f} but only {self._portfolio.cash:.4f} available."

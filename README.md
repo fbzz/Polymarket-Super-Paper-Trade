@@ -3,6 +3,8 @@
 A Python paper trading library for [Polymarket](https://polymarket.com) prediction markets.
 Connect to any market via WebSocket, trade YES/NO positions with simulated cash, and let the library handle reconnection, market rotation, and crash-safe state persistence.
 
+![alt text](image.png)
+
 ```python
 trader = PaperTrader(asset="btc", interval="5m", initial_cash=500.0)
 

@@ -23,6 +23,7 @@ from .display import (
 from .exceptions import (
     InsufficientFundsError,
     MarketResolutionError,
+    MinimumOrderError,
     NoPriceAvailableError,
     PolymarketTraderError,
     TradeAlreadyClosedError,
@@ -64,4 +65,5 @@ __all__ = [
     "TradeNotFoundError",
     "TradeAlreadyClosedError",
     "MarketResolutionError",
+    "MinimumOrderError",
 ]

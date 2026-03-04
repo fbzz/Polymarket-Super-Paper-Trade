@@ -10,6 +10,7 @@ import pytest
 
 from polymarket_trader import (
     InsufficientFundsError,
+    MinimumOrderError,
     NoPriceAvailableError,
     PaperTrader,
     TradeAlreadyClosedError,
@@ -217,6 +218,16 @@ class TestPaperTraderBuy:
         trader._latest_price = make_tick(yes=0.6)
         with pytest.raises(InsufficientFundsError):
             trader.buy("YES", shares=100)
+
+    def test_buy_below_minimum_order(self):
+        trader = fresh_trader()
+        with pytest.raises(MinimumOrderError):
+            trader.buy("YES", shares=1, price=0.50)   # cost = $0.50 < $1.00
+
+    def test_buy_exactly_minimum_order(self):
+        trader = fresh_trader()
+        trade = trader.buy("YES", shares=2, price=0.50)   # cost = $1.00 — OK
+        assert trade.is_open
 
 
 class TestPaperTraderClose:

@@ -18,5 +18,9 @@ class TradeAlreadyClosedError(PolymarketTraderError):
     """Raised when attempting to close an already-closed trade."""
 
 
+class MinimumOrderError(PolymarketTraderError):
+    """Raised when an order's total cost is below the $1.00 minimum."""
+
+
 class MarketResolutionError(PolymarketTraderError):
     """Raised when market resolution or rotation fails."""
